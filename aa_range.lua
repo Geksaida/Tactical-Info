@@ -1,7 +1,7 @@
 function widget:GetInfo()
     return {
         name = "AARangePoC",
-        desc = "Toggleable filled circles for true AA turrets/units. Remembers FoW positions. Ally ranges optional.",
+        desc = "Toggleable filled circles for true AA turrets/units. Remembers FoW positions. Ally ranges optional. Combine mode unions overlapping circles instead of stacking brightness.",
         author = "PoC",
         date = "2026-08-30",
         license = "GPLv2",
@@ -20,6 +20,7 @@ local ENEMY_COLOR = { 1.0, 0.55, 0.0 } -- orange
 local ALLY_COLOR  = { 0.25, 0.65, 1.0 } -- blue
 
 local SHOW_ALLY_BY_DEFAULT = false
+local COMBINE_BY_DEFAULT = false
 
 local UPDATE_INTERVAL = 0.2 -- how often to rescan visible units (seconds, real time)
 local MEMORY_TTL = 3000      -- seconds a circle survives without being re-sighted or LOS-checked
@@ -31,6 +32,7 @@ local DEAD_BLACKLIST_TTL = 30 -- seconds a destroyed unitID stays blocked from r
 
 local showAll = false                        -- master toggle (enemy circles)
 local showAlly = SHOW_ALLY_BY_DEFAULT        -- additionally draw own/allied AA
+local combineOverlap = COMBINE_BY_DEFAULT    -- union overlapping circles instead of stacking alpha
 
 local aaRangeByDef = {}
 local cacheBuilt = false
@@ -45,9 +47,18 @@ local myAllyTeam = Spring.GetMyAllyTeamID()
 local uiClock = 0         -- accumulated real time, used for toggle debounce
 local lastToggleClock = -1
 local lastAllyToggleClock = -1
+local lastCombineToggleClock = -1
 local sinceUpdate = 0
 
 local hasPosInLos = type(Spring.IsPosInLos) == "function"
+
+-- Stencil-based union drawing needs these three entry points. Some very old
+-- engine builds may not expose them; detect once and fall back gracefully
+-- instead of silently drawing nothing.
+local hasStencilSupport = type(gl.StencilTest) == "function"
+    and type(gl.StencilFunc) == "function"
+    and type(gl.StencilOp) == "function"
+    and type(gl.StencilMask) == "function"
 
 --------------------------------------------------------------------------------
 -- Commands
@@ -65,6 +76,17 @@ local function ToggleAlly()
     lastAllyToggleClock = uiClock
     showAlly = not showAlly
     Spring.Echo("[AARangePoC] Ally AA ranges: " .. (showAlly and "ON" or "OFF"))
+end
+
+local function ToggleCombine()
+    if uiClock - lastCombineToggleClock < 0.25 then return end
+    lastCombineToggleClock = uiClock
+    if not hasStencilSupport then
+        Spring.Echo("[AARangePoC] Combine mode needs stencil buffer support, which this engine build doesn't expose. Staying in overlap mode.")
+        return
+    end
+    combineOverlap = not combineOverlap
+    Spring.Echo("[AARangePoC] Combine overlapping circles: " .. (combineOverlap and "ON" or "OFF"))
 end
 
 local function ClearMemory()
@@ -271,6 +293,37 @@ local function DrawFilledGroundCircle(x, y, z, radius, segments)
     end)
 end
 
+-- Draws every circle in dataList (already filtered to one ally/enemy group) in
+-- a single flat color+alpha, regardless of how many of them overlap a given
+-- pixel. Uses the stencil buffer as a per-pixel "already painted" mark: the
+-- first circle to cover a pixel stamps stencilRef there and paints it; every
+-- later circle in the same group is stencil-rejected on that pixel, so it
+-- never blends a second time. That makes a lone circle and an N-circle
+-- pileup produce the exact same color/opacity - a real boolean union rather
+-- than an approximation.
+local function DrawCircleGroupCombined(dataList, color, stencilRef)
+    gl.StencilFunc(GL.NOTEQUAL, stencilRef, 0xFF)
+    gl.StencilOp(GL.KEEP, GL.KEEP, GL.REPLACE)
+    gl.Color(color[1], color[2], color[3], FILL_ALPHA)
+    for _, data in pairs(dataList) do
+        local range = aaRangeByDef[data.defID]
+        if range and range > 0 then
+            DrawFilledGroundCircle(data.x, data.y, data.z, range, SEGMENTS)
+        end
+    end
+end
+
+-- Original behavior: additive blending, so overlaps visibly brighten.
+local function DrawCircleGroupAdditive(dataList, color)
+    gl.Color(color[1], color[2], color[3], FILL_ALPHA)
+    for _, data in pairs(dataList) do
+        local range = aaRangeByDef[data.defID]
+        if range and range > 0 then
+            DrawFilledGroundCircle(data.x, data.y, data.z, range, SEGMENTS)
+        end
+    end
+end
+
 local function TryGetKeyCode(names)
     if not Spring.GetKeyCode then return nil end
     for _, name in ipairs(names) do
@@ -308,6 +361,12 @@ local function GetAllyButtonRect()
     local x0, y0, x1, _ = GetButtonRect()
     local ay1 = y0 - BTN_GAP
     return x0, ay1 - BTN_H, x1, ay1
+end
+
+local function GetCombineButtonRect()
+    local x0, ay0, x1, _ = GetAllyButtonRect()
+    local cy1 = ay0 - BTN_GAP
+    return x0, cy1 - BTN_H, x1, cy1
 end
 
 local function DrawButton(x0, y0, x1, y1, on, label, enabled)
@@ -419,14 +478,19 @@ function widget:Initialize()
 
     widgetHandler:AddAction("aarange", Toggle, nil, "p")
     widgetHandler:AddAction("aaally", ToggleAlly, nil, "p")
+    widgetHandler:AddAction("aacombine", ToggleCombine, nil, "p")
     widgetHandler:AddAction("aaclear", ClearMemory, nil, "p")
 
-    Spring.Echo("[AARangePoC] loaded. Ctrl+D or /aarange toggles enemy AA. Ctrl+Shift+D or /aaally adds allied AA. /aaclear wipes remembered units.")
+    Spring.Echo("[AARangePoC] loaded. Ctrl+D or /aarange toggles enemy AA. Ctrl+Shift+D or /aaally adds allied AA. Ctrl+Alt+D or /aacombine unions overlapping circles. /aaclear wipes remembered units.")
+    if not hasStencilSupport then
+        Spring.Echo("[AARangePoC] Note: this engine build has no stencil gl functions, so combine mode is unavailable.")
+    end
 end
 
 function widget:Shutdown()
     widgetHandler:RemoveAction("aarange")
     widgetHandler:RemoveAction("aaally")
+    widgetHandler:RemoveAction("aacombine")
     widgetHandler:RemoveAction("aaclear")
 end
 
@@ -435,6 +499,7 @@ function widget:TextCommand(command)
     local cmd = lower(command)
     if cmd == "aarange" then Toggle() return true end
     if cmd == "aaally" then ToggleAlly() return true end
+    if cmd == "aacombine" then ToggleCombine() return true end
     if cmd == "aaclear" then ClearMemory() return true end
     return false
 end
@@ -442,7 +507,9 @@ end
 function widget:KeyPress(key, mods, isRepeat)
     if isRepeat or not mods or not mods.ctrl then return false end
     if not KeyIsD(key) then return false end
-    if mods.shift then
+    if mods.alt then
+        ToggleCombine()
+    elseif mods.shift then
         ToggleAlly()
     else
         Toggle()
@@ -455,27 +522,44 @@ function widget:DrawWorld()
 
     gl.DepthTest(false)
     gl.Blending(true)
-    gl.BlendFunc(GL.SRC_ALPHA, GL.ONE) -- additive: overlapping circles brighten, showing density
 
-    gl.Color(ENEMY_COLOR[1], ENEMY_COLOR[2], ENEMY_COLOR[3], FILL_ALPHA)
-    for _, data in pairs(trackedUnits) do
-        if not data.isAlly then
-            local range = aaRangeByDef[data.defID]
-            if range and range > 0 then
-                DrawFilledGroundCircle(data.x, data.y, data.z, range, SEGMENTS)
-            end
+    local useCombine = combineOverlap and hasStencilSupport
+
+    -- Split the tracked units into per-group lists once; both draw paths need this.
+    local enemyList, allyList = {}, {}
+    for uid, data in pairs(trackedUnits) do
+        if data.isAlly then
+            if showAlly then allyList[uid] = data end
+        else
+            enemyList[uid] = data
         end
     end
 
-    if showAlly then
-        gl.Color(ALLY_COLOR[1], ALLY_COLOR[2], ALLY_COLOR[3], FILL_ALPHA)
-        for _, data in pairs(trackedUnits) do
-            if data.isAlly then
-                local range = aaRangeByDef[data.defID]
-                if range and range > 0 then
-                    DrawFilledGroundCircle(data.x, data.y, data.z, range, SEGMENTS)
-                end
-            end
+    if useCombine then
+        -- One clear per frame; enemy and ally each get their own stencil
+        -- reference value so a group unions with itself while still being
+        -- able to layer on top of the other group's already-painted pixels.
+        gl.StencilMask(0xFF)
+        gl.Clear(GL.STENCIL_BUFFER_BIT, 0)
+        gl.StencilTest(true)
+        -- Additive, same as overlap mode - the stencil (not the blend func)
+        -- is what removes double-painting, so using the same equation here
+        -- makes a lone circle and a unioned overlap come out identically
+        -- bright instead of the union looking dimmer.
+        gl.BlendFunc(GL.SRC_ALPHA, GL.ONE)
+
+        DrawCircleGroupCombined(enemyList, ENEMY_COLOR, 1)
+        if showAlly then
+            DrawCircleGroupCombined(allyList, ALLY_COLOR, 2)
+        end
+
+        gl.StencilTest(false)
+    else
+        gl.BlendFunc(GL.SRC_ALPHA, GL.ONE) -- additive: overlapping circles brighten, showing density
+
+        DrawCircleGroupAdditive(enemyList, ENEMY_COLOR)
+        if showAlly then
+            DrawCircleGroupAdditive(allyList, ALLY_COLOR)
         end
     end
 
@@ -492,6 +576,14 @@ function widget:DrawScreen()
     local ax0, ay0, ax1, ay1 = GetAllyButtonRect()
     DrawButton(ax0, ay0, ax1, ay1, showAlly,
         "Ally AA: " .. (showAlly and "ON" or "OFF") .. " [Ctrl+Shift+D]", showAll)
+    --[[
+    local cx0, cy0, cx1, cy1 = GetCombineButtonRect()
+    local combineLabel = "Combine: " .. (combineOverlap and "ON" or "OFF") .. " [Ctrl+Alt+D]"
+    if not hasStencilSupport then
+        combineLabel = "Combine: N/A (no stencil)"
+    end
+    DrawButton(cx0, cy0, cx1, cy1, combineOverlap, combineLabel, showAll and hasStencilSupport)
+    --]]
 end
 
 function widget:MousePress(x, y, button)
@@ -506,6 +598,12 @@ function widget:MousePress(x, y, button)
     local ax0, ay0, ax1, ay1 = GetAllyButtonRect()
     if x >= ax0 and x <= ax1 and y >= ay0 and y <= ay1 then
         ToggleAlly()
+        return true
+    end
+
+    local cx0, cy0, cx1, cy1 = GetCombineButtonRect()
+    if x >= cx0 and x <= cx1 and y >= cy0 and y <= cy1 then
+        ToggleCombine()
         return true
     end
 
