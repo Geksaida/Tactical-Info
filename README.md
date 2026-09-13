@@ -31,7 +31,7 @@ Each compact label shows the unit count and nominal combat score of the group. H
 - power able to retaliate immediately at the weakest edge
 - response-weighted power at that edge after five seconds
 
-Each group is enclosed by a lightly filled, padded formation hull. Allied hulls are rounded while enemy hulls use more angular corners so their orange outlines do not resemble jammer-range circles. A thicker condition-colored hull segment marks the weakest edge. Labels avoid one another, disappear rather than clamp to the screen border, and are reduced at distant strategic zoom. Unit positions and power are smoothed, while weak-direction hysteresis prevents near-tied edges from flickering. Analysis is rebuilt once per second and uses a spatial grid to keep the cost bounded in large games.
+Analysis is rebuilt once per second.
 
 **Controls**
 
