@@ -4,6 +4,16 @@
 
 A widget that draws filled circles on the ground showing the engagement range of anti-air units. Enemy ranges are drawn in orange, allied ranges in blue.
 
+## Screenshots
+
+### Tactical group evaluation
+
+![Tactical groups and their formation hulls](screenshot2.png)
+
+### Dense AA coverage
+
+![Overlapping anti-air coverage ranges](screenshot3.png)
+
 Two render modes are available:
 
 - **Overlap mode** (default) — additive blending, so overlapping circles brighten, giving a visual readout of AA coverage density.
