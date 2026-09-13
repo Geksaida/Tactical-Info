@@ -19,12 +19,29 @@ local SEGMENTS = 32
 local ENEMY_COLOR = { 1.0, 0.55, 0.0 } -- orange
 local ALLY_COLOR  = { 0.25, 0.65, 1.0 } -- blue
 
+local ANTI_NUKE_LINE_COLOR = { 1.0, 1.0, 1.0 } -- white
+local ANTI_NUKE_OUTLINE_WIDTH = 3.0
+local ANTI_NUKE_HATCH_ALPHA = 0.2
+local ANTI_NUKE_HATCH_WIDTH = 3
+local ANTI_NUKE_HATCH_SPACING = 60
+local ANTI_NUKE_HATCH_ORIGIN_X = 0
+local ANTI_NUKE_HATCH_ORIGIN_Z = 0
+local ANTI_NUKE_RANGE = 2000
+
 local SHOW_ALLY_BY_DEFAULT = false
 local COMBINE_BY_DEFAULT = false
 
 local UPDATE_INTERVAL = 0.2 -- how often to rescan visible units (seconds, real time)
 local MEMORY_TTL = 3000      -- seconds a circle survives without being re-sighted or LOS-checked
 local DEAD_BLACKLIST_TTL = 30 -- seconds a destroyed unitID stays blocked from re-entry
+
+-- Anti-nuke (ABM / missile-defense) unit def names — enemy only
+local ANTI_NUKE_NAMES = {
+    armamd  = true,
+    armscab = true,
+    corfmd  = true,
+    cormabm = true,
+}
 
 --------------------------------------------------------------------------------
 -- State
@@ -40,6 +57,7 @@ local cacheBuilt = false
 local dKey = nil
 
 local trackedUnits = {}   -- uid -> { defID, x, y, z, lastSeen, isAlly }
+local antiNukeUnits = {}  -- uid -> { defID, x, y, z, lastSeen }  (enemy only)
 local deadUnits = {}      -- uid -> gameTime of death (blocks the death-sequence re-add race)
 
 local myAllyTeam = Spring.GetMyAllyTeamID()
@@ -92,7 +110,9 @@ end
 local function ClearMemory()
     local count = 0
     for _ in pairs(trackedUnits) do count = count + 1 end
+    for _ in pairs(antiNukeUnits) do count = count + 1 end
     trackedUnits = {}
+    antiNukeUnits = {}
     Spring.Echo("[AARangePoC] Cleared " .. count .. " remembered unit(s).")
 end
 
@@ -293,6 +313,100 @@ local function DrawFilledGroundCircle(x, y, z, radius, segments)
     end)
 end
 
+-- Draw a circle outline (bold ring) on the ground
+local function DrawGroundCircleOutline(x, y, z, radius, segments)
+    if not (GL and GL.LINE_LOOP and gl.BeginEnd and gl.Vertex) then return end
+    gl.BeginEnd(GL.LINE_LOOP, function()
+        for i = 0, segments do
+            local a = (2 * math.pi * i) / segments
+            gl.Vertex(x + radius * math.cos(a), y, z + radius * math.sin(a))
+        end
+    end)
+end
+
+-- Build diagonal hatch lines clipped inside a ground circle.
+-- Returns a flat table { x1, y, z1, x2, y, z2, ... } suitable for GL.LINES.
+--
+-- IMPORTANT:
+-- The hatch pattern is defined in WORLD coordinates, not relative to
+-- the circle center. Therefore overlapping anti-nuke circles use exactly
+-- the same hatch lines and overlay perfectly.
+--
+-- Hatch direction:  (1,  1)
+-- Hatch normal:     (1, -1)
+local function BuildHatchLines(x, y, z, radius)
+    local vertices = {}
+    local spacing = ANTI_NUKE_HATCH_SPACING
+
+    if radius <= 0 or spacing <= 0 then
+        return vertices
+    end
+
+    local hatchY = y + 1
+
+    local invSqrt2 = 1 / math.sqrt(2)
+
+    -- Unit vectors:
+    -- d = direction along each hatch line
+    -- n = direction separating adjacent hatch lines
+    local dx = invSqrt2
+    local dz = invSqrt2
+
+    local nx = invSqrt2
+    local nz = -invSqrt2
+
+    local radiusSq = radius * radius
+
+    -- Project the fixed world-space hatch origin onto the hatch normal.
+    -- Every circle therefore uses the exact same sequence of hatch lines.
+    local originNormal =
+        ANTI_NUKE_HATCH_ORIGIN_X * nx +
+        ANTI_NUKE_HATCH_ORIGIN_Z * nz
+
+    -- Projection of this circle center onto the same normal.
+    local centerNormal =
+        x * nx +
+        z * nz
+
+    -- Find the hatch-line indices whose normal coordinates intersect
+    -- this circle.
+    local minIndex = math.ceil((centerNormal - radius - originNormal) / spacing)
+    local maxIndex = math.floor((centerNormal + radius - originNormal) / spacing)
+
+    for i = minIndex, maxIndex do
+        -- World-space normal coordinate of this hatch line.
+        local lineNormal = originNormal + i * spacing
+
+        -- Offset from the circle center along the hatch normal.
+        local offset = lineNormal - centerNormal
+
+        if math.abs(offset) < radius then
+            local halfChord = math.sqrt(
+                math.max(0, radiusSq - offset * offset)
+            )
+
+            -- Center of the chord where the infinite world-space hatch
+            -- line intersects this circle.
+            local cx = x + offset * nx
+            local cz = z + offset * nz
+
+            -- Extend halfChord in the hatch direction.
+            local halfDX = halfChord * dx
+            local halfDZ = halfChord * dz
+
+            vertices[#vertices + 1] = cx - halfDX
+            vertices[#vertices + 1] = hatchY
+            vertices[#vertices + 1] = cz - halfDZ
+
+            vertices[#vertices + 1] = cx + halfDX
+            vertices[#vertices + 1] = hatchY
+            vertices[#vertices + 1] = cz + halfDZ
+        end
+    end
+
+    return vertices
+end
+
 -- Draws every circle in dataList (already filtered to one ally/enemy group) in
 -- a single flat color+alpha, regardless of how many of them overlap a given
 -- pixel. Uses the stencil buffer as a per-pixel "already painted" mark: the
@@ -412,9 +526,23 @@ function widget:Update(dt)
             -- rescan re-adds the corpse and the circle becomes permanent.
             if not deadUnits[uid] and Spring.GetUnitIsDead(uid) ~= true then
                 local defID = Spring.GetUnitDefID(uid) -- nil for radar-only blips
-                if defID and aaRangeByDef[defID] then
-                    local x, y, z = Spring.GetUnitPosition(uid)
-                    if x then
+                local x, y, z = Spring.GetUnitPosition(uid)
+
+                if x then
+                    local isAlly = IsAllyUnit(uid)
+
+                    -- Check for anti-nuke units (enemy only)
+                    local defName = UnitDefs[defID] and UnitDefs[defID].name
+                    if defName and ANTI_NUKE_NAMES[defName] and not isAlly then
+                        seen[uid] = true
+                        antiNukeUnits[uid] = {
+                            defID = defID,
+                            x = x,
+                            y = Spring.GetGroundHeight(x, z) or y or 0,
+                            z = z,
+                            lastSeen = now,
+                        }
+                    elseif defID and aaRangeByDef[defID] then
                         seen[uid] = true
                         trackedUnits[uid] = {
                             defID = defID,
@@ -422,7 +550,7 @@ function widget:Update(dt)
                             y = Spring.GetGroundHeight(x, z) or y or 0,
                             z = z,
                             lastSeen = now,
-                            isAlly = IsAllyUnit(uid),
+                            isAlly = isAlly,
                         }
                     end
                 end
@@ -443,6 +571,17 @@ function widget:Update(dt)
         end
     end
 
+    -- Prune remembered anti-nuke units we did not see this tick.
+    for uid, data in pairs(antiNukeUnits) do
+        if not seen[uid] then
+            if hasPosInLos and Spring.IsPosInLos(data.x, data.y, data.z) then
+                antiNukeUnits[uid] = nil
+            elseif now - (data.lastSeen or now) > MEMORY_TTL then
+                antiNukeUnits[uid] = nil
+            end
+        end
+    end
+
     -- Expire the death blacklist so it doesn't grow all match and so recycled
     -- unitIDs aren't suppressed forever.
     for uid, t in pairs(deadUnits) do
@@ -452,6 +591,7 @@ end
 
 function widget:UnitDestroyed(unitID)
     trackedUnits[unitID] = nil
+    antiNukeUnits[unitID] = nil
     deadUnits[unitID] = Spring.GetGameSeconds()
 end
 
@@ -561,6 +701,48 @@ function widget:DrawWorld()
         if showAlly then
             DrawCircleGroupAdditive(allyList, ALLY_COLOR)
         end
+    end
+
+    -- Anti-nuke circles: bold white outline + hatched interior (enemy only)
+    if next(antiNukeUnits) then
+        gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
+        gl.DepthTest(false)
+
+        -- Collect all hatch vertices into a single array
+        local allHatchVerts = {}
+        for _, data in pairs(antiNukeUnits) do
+            local verts = BuildHatchLines(data.x, data.y, data.z, ANTI_NUKE_RANGE)
+            for i = 1, #verts do
+                allHatchVerts[#allHatchVerts + 1] = verts[i]
+            end
+        end
+
+        -- Draw hatch lines.
+        -- Use immediate mode to avoid depending on gl.Lines() vertex-table format.
+        if #allHatchVerts > 0 and GL and GL.LINES and gl.BeginEnd and gl.Vertex then
+            gl.LineWidth(ANTI_NUKE_HATCH_WIDTH)
+            gl.Color(
+                ANTI_NUKE_LINE_COLOR[1],
+                ANTI_NUKE_LINE_COLOR[2],
+                ANTI_NUKE_LINE_COLOR[3],
+                ANTI_NUKE_HATCH_ALPHA
+            )
+
+            gl.BeginEnd(GL.LINES, function()
+                for i = 1, #allHatchVerts, 3 do
+                    gl.Vertex(allHatchVerts[i], allHatchVerts[i + 1], allHatchVerts[i + 2])
+                end
+            end)
+        end
+
+        -- Bold white outlines (more segments for a smooth-looking ring)
+        gl.LineWidth(ANTI_NUKE_OUTLINE_WIDTH)
+        gl.Color(ANTI_NUKE_LINE_COLOR[1], ANTI_NUKE_LINE_COLOR[2], ANTI_NUKE_LINE_COLOR[3], 1.0)
+        local antiNukeOutlineSegments = math.max(96, math.ceil(2 * math.pi * ANTI_NUKE_RANGE / 20))
+        for _, data in pairs(antiNukeUnits) do
+            DrawGroundCircleOutline(data.x, data.y, data.z, ANTI_NUKE_RANGE, antiNukeOutlineSegments)
+        end
+        gl.LineWidth(1.0)
     end
 
     gl.Color(1.0, 1.0, 1.0, 1.0)
