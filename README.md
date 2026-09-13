@@ -11,6 +11,18 @@ Two render modes are available:
 
 Positions of previously sighted units are remembered, so ranges persist even after a unit has left — fading away once the spot is confirmed clear.
 
+## Tactical group evaluation
+
+The optional tactical overlay groups nearby ground combat units by their ability to support the same fight, then samples an attack from eight directions around each formation. Pairwise-connected formations are recursively split until every member is within its short-term combat reach of the group's geometric center, preventing chains of distant units from becoming one group. Groups smaller than five units are omitted because they are easy to assess directly. Cheap units remain eligible during the opening. They are suppressed only after three compact formations are active with at least four units costing 200 or more metal in each. The overlay deliberately does **not** treat the group's total value as power that is instantly available everywhere.
+
+Each compact label shows the unit count and nominal combat score of the group. Hover the label for:
+
+- nominal combat score of the whole group (DPS × durability, health-adjusted)
+- power able to retaliate immediately at the weakest edge
+- response-weighted power at that edge after five seconds
+
+Each group is enclosed by a lightly filled, padded formation hull. Allied hulls are rounded while enemy hulls use more angular corners so their orange outlines do not resemble jammer-range circles. A thicker condition-colored hull segment marks the weakest edge. Labels avoid one another, disappear rather than clamp to the screen border, and are reduced at distant strategic zoom. Unit positions and power are smoothed, while weak-direction hysteresis prevents near-tied edges from flickering. Analysis is rebuilt once per second and uses a spatial grid to keep the cost bounded in large games.
+
 **Controls**
 
 | Action | Key | Chat command |
@@ -18,6 +30,7 @@ Positions of previously sighted units are remembered, so ranges persist even aft
 | Toggle enemy AA ranges | `Ctrl+D` | `/aarange` |
 | Toggle allied AA ranges | `Ctrl+Shift+D` | `/aaally` |
 | Toggle combine mode | `Ctrl+Alt+D` | `/aacombine` |
+| Toggle tactical groups | `Ctrl+G` | `/aatactical` |
 | Clear remembered positions | — | `/aaclear` |
 
 On-screen buttons are also available for mouse control.
