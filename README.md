@@ -10,9 +10,9 @@ A widget that draws filled circles on the ground showing the engagement range of
 
 ![Tactical groups and their formation hulls](screenshot2.png)
 
-### Dense AA coverage
+### Anti-nuke coverage
 
-![Overlapping anti-air coverage ranges](screenshot3.png)
+![Overlapping anti-nuke coverage ranges](screenshot3.png)
 
 Two render modes are available:
 
